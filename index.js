@@ -1,6 +1,6 @@
 // index.js
 //
-// Сервер каталога изделий.
+// Сервер для "Каталога деталей крана КС-8165".
 // Express + PostgreSQL + JWT + загрузка файлов + статистика хранилища.
 
 require('dotenv').config();
@@ -16,32 +16,37 @@ const fs = require('fs');
 
 const app = express();
 
-// ===== НАСТРОЙКИ =====
+// ---------------- НАСТРОЙКИ ----------------
+
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_secret';
 
-// Каталог для файлов
+// Каталог хранения файлов (2D/3D)
 const UPLOAD_ROOT = path.join(__dirname, 'uploads');
-// Лимит хранилища (примерно 2 ГиБ)
+// Лимит хранилища: 2 ГиБ (можно менять)
 const STORAGE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
 
-// Создать каталог, если его нет
+// Создаём каталог файлов, если его нет
 if (!fs.existsSync(UPLOAD_ROOT)) {
   fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
 }
 
-// ===== PostgreSQL =====
+// ---------------- PostgreSQL ----------------
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
-// ===== Мидлвары =====
+// ---------------- МИДЛВАРЫ ----------------
+
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static(UPLOAD_ROOT)); // раздача файлов
 
-// Загрузка файлов (multer)
+// Раздача загруженных файлов
+app.use('/uploads', express.static(UPLOAD_ROOT));
+
+// Multer: загрузка файлов
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_ROOT),
   filename: (req, file, cb) => {
@@ -52,10 +57,15 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ===== ВСПОМОГАТЕЛЬНЫЕ =====
-function generateToken(user) {
+// ---------------- ВСПОМОГАТЕЛЬНЫЕ ----------------
+
+function generateToken(adminRow) {
   return jwt.sign(
-    { id: user.id, email: user.email, isAdmin: user.is_admin },
+    {
+      id: adminRow.id,
+      email: adminRow.email,
+      isAdmin: adminRow.is_admin,
+    },
     JWT_SECRET,
     { expiresIn: '12h' }
   );
@@ -105,11 +115,14 @@ async function getDirStats(dir) {
   return { totalBytes, fileCount };
 }
 
-// ===== АВТОРИЗАЦИЯ =====
+// ---------------- АВТОРИЗАЦИЯ АДМИНА ----------------
+//
+// POST /api/auth/login
+// body: { username, password }  (username = email)
 
-// POST /api/auth/login { username, password }
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
+
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password required' });
   }
@@ -119,41 +132,44 @@ app.post('/api/auth/login', async (req, res) => {
       'SELECT id, email, password_hash, is_admin FROM admins WHERE email = $1',
       [username]
     );
-    if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const user = rows[0];
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!rows.length) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-    const token = generateToken(user);
-    return res.json({ token });
+    const admin = rows[0];
+    const ok = await bcrypt.compare(password, admin.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = generateToken(admin);
+    res.json({ token });
   } catch (e) {
     console.error('login error', e);
-    return res.status(500).json({ error: 'Login failed' });
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// ===== ПРОДУКТЫ =====
+// ---------------- ИЗДЕЛИЯ ----------------
+//
+// !!! Важно: здесь мы не трогаем BOM, просто отдаём список всех изделий.
+// Логику "подсборки не показывать отдельно" делает фронтенд.
 
-/**
- * Корневые изделия — те, которые нигде не используются как дочерние.
- * В твоей схеме BOM использует колонку product_id.
- */
 app.get('/api/products/root', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT p.*
-      FROM products p
-      LEFT JOIN bom_items b ON b.product_id = p.id
-      WHERE b.id IS NULL
-      ORDER BY p.code
+      SELECT id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
+             image_url, model_url
+      FROM products
+      ORDER BY code
       `
     );
-    return res.json(rows);
+    res.json(rows);
   } catch (e) {
     console.error('root products error', e);
-    return res.status(500).json({ error: 'Failed to load root products' });
+    res.status(500).json({ error: 'Failed to load root products' });
   }
 });
 
@@ -161,18 +177,29 @@ app.get('/api/products/root', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const { rows } = await pool.query('SELECT * FROM products WHERE id = $1', [
-      id,
-    ]);
-    if (!rows.length) return res.status(404).json({ error: 'Product not found' });
-    return res.json(rows[0]);
+    const { rows } = await pool.query(
+      `
+      SELECT id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
+             image_url, model_url
+      FROM products
+      WHERE id = $1
+      `,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    res.json(rows[0]);
   } catch (e) {
     console.error('product error', e);
-    return res.status(500).json({ error: 'Failed to load product' });
+    res.status(500).json({ error: 'Failed to load product' });
   }
 });
 
 // Состав сборки (дети)
+// products.id = bom_items.product_id
 app.get('/api/products/:id/children', async (req, res) => {
   const { id } = req.params;
   try {
@@ -188,7 +215,9 @@ app.get('/api/products/:id/children', async (req, res) => {
         p.mass_kg,
         p.length_mm,
         p.width_mm,
-        p.height_mm
+        p.height_mm,
+        p.image_url,
+        p.model_url
       FROM bom_items b
       JOIN products p ON p.id = b.product_id
       WHERE b.parent_id = $1
@@ -196,14 +225,15 @@ app.get('/api/products/:id/children', async (req, res) => {
       `,
       [id]
     );
-    return res.json(rows);
+    res.json(rows);
   } catch (e) {
     console.error('children error', e);
-    return res.status(500).json({ error: 'Failed to load children' });
+    res.status(500).json({ error: 'Failed to load children' });
   }
 });
 
 // Создание изделия (только админ)
+// body: { code, name, type, mass_kg, length_mm, width_mm, height_mm, parentId, quantityInParent }
 app.post('/api/products', authRequired, async (req, res) => {
   if (!req.user || !req.user.isAdmin) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -222,19 +252,21 @@ app.post('/api/products', authRequired, async (req, res) => {
   } = req.body || {};
 
   if (!code || !name || !type) {
-    return res.status(400).json({ error: 'Code, name, type required' });
+    return res.status(400).json({ error: 'Code, name and type are required' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const insertProduct = `
+    const insertProdSql = `
       INSERT INTO products (code, name, type, mass_kg, length_mm, width_mm, height_mm)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *
+      RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
+                image_url, model_url
     `;
-    const { rows } = await client.query(insertProduct, [
+
+    const { rows } = await client.query(insertProdSql, [
       code,
       name,
       type,
@@ -243,10 +275,15 @@ app.post('/api/products', authRequired, async (req, res) => {
       width_mm ?? null,
       height_mm ?? null,
     ]);
+
     const product = rows[0];
 
+    // Если задан parentId — добавляем строку в BOM
     if (parentId) {
-      const qty = quantityInParent ?? 1;
+      const qty = quantityInParent && Number(quantityInParent) > 0
+        ? Number(quantityInParent)
+        : 1;
+
       await client.query(
         `
         INSERT INTO bom_items (parent_id, product_id, quantity)
@@ -257,38 +294,47 @@ app.post('/api/products', authRequired, async (req, res) => {
     }
 
     await client.query('COMMIT');
-    return res.status(201).json(product);
+    res.status(201).json(product);
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('create product error', e);
-    return res.status(500).json({ error: 'Failed to create product' });
+    res.status(500).json({ error: 'Failed to create product' });
   } finally {
     client.release();
   }
 });
 
-// Обновление изделия
+// Обновление изделия (только админ)
 app.put('/api/products/:id', authRequired, async (req, res) => {
   if (!req.user || !req.user.isAdmin) {
     return res.status(403).json({ error: 'Forbidden' });
   }
+
   const { id } = req.params;
-  const { code, name, type, mass_kg, length_mm, width_mm, height_mm } =
-    req.body || {};
+  const {
+    code,
+    name,
+    type,
+    mass_kg,
+    length_mm,
+    width_mm,
+    height_mm,
+  } = req.body || {};
 
   try {
     const { rows } = await pool.query(
       `
       UPDATE products
-      SET code = $1,
-          name = $2,
-          type = $3,
-          mass_kg = $4,
+      SET code      = $1,
+          name      = $2,
+          type      = $3,
+          mass_kg   = $4,
           length_mm = $5,
-          width_mm = $6,
+          width_mm  = $6,
           height_mm = $7
       WHERE id = $8
-      RETURNING *
+      RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
+                image_url, model_url
       `,
       [
         code,
@@ -302,30 +348,38 @@ app.put('/api/products/:id', authRequired, async (req, res) => {
       ]
     );
 
-    if (!rows.length) return res.status(404).json({ error: 'Product not found' });
-    return res.json(rows[0]);
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    res.json(rows[0]);
   } catch (e) {
     console.error('update product error', e);
-    return res.status(500).json({ error: 'Failed to update product' });
+    res.status(500).json({ error: 'Failed to update product' });
   }
 });
 
-// Удаление позиции BOM
+// Удаление позиции BOM (строки состава)
 app.delete('/api/bom/:id', authRequired, async (req, res) => {
   if (!req.user || !req.user.isAdmin) {
     return res.status(403).json({ error: 'Forbidden' });
   }
+
   const { id } = req.params;
   try {
     await pool.query('DELETE FROM bom_items WHERE id = $1', [id]);
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error('delete bom error', e);
-    return res.status(500).json({ error: 'Failed to delete bom item' });
+    res.status(500).json({ error: 'Failed to delete bom item' });
   }
 });
 
-// ===== ЗАГРУЗКА ФАЙЛОВ =====
+// ---------------- ЗАГРУЗКА ФАЙЛОВ ----------------
+//
+// POST /api/products/:id/media
+// form-data: file=<file>, kind=image|model
+
 app.post(
   '/api/products/:id/media',
   authRequired,
@@ -338,13 +392,14 @@ app.post(
 
     const { id } = req.params;
     const { kind } = req.body || {};
+
     if (!req.file || !kind) {
       if (req.file) fs.unlink(req.file.path, () => {});
-      return res.status(400).json({ error: 'file and kind required' });
+      return res.status(400).json({ error: 'file and kind are required' });
     }
 
     if (kind !== 'image' && kind !== 'model') {
-      fs.unlink(req.file.path, () => {});
+      if (req.file) fs.unlink(req.file.path, () => {});
       return res.status(400).json({ error: 'kind must be image or model' });
     }
 
@@ -362,16 +417,19 @@ app.post(
           [url, id]
         );
       }
-      return res.json({ url });
+
+      res.json({ url });
     } catch (e) {
       console.error('media update error', e);
-      fs.unlink(req.file.path, () => {});
-      return res.status(500).json({ error: 'Failed to save media' });
+      if (req.file) fs.unlink(req.file.path, () => {});
+      res.status(500).json({ error: 'Failed to save media' });
     }
   }
 );
 
-// ===== КОРЗИНА =====
+// ---------------- КОРЗИНА ----------------
+
+// GET /api/cart
 app.get('/api/cart', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -387,16 +445,19 @@ app.get('/api/cart', async (req, res) => {
       ORDER BY c.id
       `
     );
-    return res.json(rows);
+    res.json(rows);
   } catch (e) {
     console.error('cart get error', e);
-    return res.status(500).json({ error: 'Failed to load cart' });
+    res.status(500).json({ error: 'Failed to load cart' });
   }
 });
 
+// POST /api/cart/add { productId, quantity }
 app.post('/api/cart/add', async (req, res) => {
   const { productId, quantity } = req.body || {};
-  if (!productId) return res.status(400).json({ error: 'productId required' });
+  if (!productId) {
+    return res.status(400).json({ error: 'productId required' });
+  }
 
   const qty = quantity && Number(quantity) > 0 ? Number(quantity) : 1;
 
@@ -405,6 +466,7 @@ app.post('/api/cart/add', async (req, res) => {
       'SELECT id, quantity FROM cart_items WHERE product_id = $1',
       [productId]
     );
+
     if (rows.length) {
       const current = Number(rows[0].quantity) || 0;
       await pool.query(
@@ -417,25 +479,30 @@ app.post('/api/cart/add', async (req, res) => {
         [productId, qty]
       );
     }
-    return res.json({ ok: true });
+
+    res.json({ ok: true });
   } catch (e) {
     console.error('cart add error', e);
-    return res.status(500).json({ error: 'Failed to add to cart' });
+    res.status(500).json({ error: 'Failed to add to cart' });
   }
 });
 
+// DELETE /api/cart/:id
 app.delete('/api/cart/:id', async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('DELETE FROM cart_items WHERE id = $1', [id]);
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error('cart delete error', e);
-    return res.status(500).json({ error: 'Failed to delete from cart' });
+    res.status(500).json({ error: 'Failed to delete from cart' });
   }
 });
 
-// ===== АДМИН: ХРАНИЛИЩЕ =====
+// ---------------- АДМИН: ХРАНИЛИЩЕ ----------------
+//
+// GET /api/admin/storage  (только админ)
+
 app.get('/api/admin/storage', authRequired, async (req, res) => {
   try {
     if (!req.user || !req.user.isAdmin) {
@@ -447,7 +514,7 @@ app.get('/api/admin/storage', authRequired, async (req, res) => {
     const limit = STORAGE_LIMIT_BYTES;
     const available = Math.max(0, limit - used);
 
-    return res.json({
+    res.json({
       totalFiles: fileCount,
       totalBytesUsed: used,
       totalBytesLimit: limit,
@@ -455,16 +522,18 @@ app.get('/api/admin/storage', authRequired, async (req, res) => {
     });
   } catch (e) {
     console.error('storage stats error', e);
-    return res.status(500).json({ error: 'Failed to read storage stats' });
+    res.status(500).json({ error: 'Failed to read storage stats' });
   }
 });
 
-// ===== ТЕСТОВЫЙ РУТ =====
+// ---------------- ПРОВЕРОЧНЫЙ РУТ ----------------
+
 app.get('/', (req, res) => {
   res.send('API is running');
 });
 
-// ===== СТАРТ =====
+// ---------------- СТАРТ СЕРВЕРА ----------------
+
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
