@@ -230,3 +230,102 @@ app.post('/api/nodes', async (req, res) => {
       await db.query(
         `INSERT INTO bom_items (parent_product_id, child_product_id, quantity)
          VALUES ($1, $2, $3)`,
+        [parentIdNum, product.id, q]
+      );
+    }
+
+    res.status(201).json({ product });
+  } catch (e) {
+    console.error('POST /api/nodes error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+/**
+ * КОРЗИНА
+ */
+
+// Корзина: получить все позиции
+app.get('/api/cart', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        c.id,
+        c.quantity,
+        p.id   AS product_id,
+        p.code,
+        p.name
+      FROM cart_items c
+      JOIN products p ON p.id = c.product_id
+      ORDER BY c.id;
+    `);
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error('GET /api/cart error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// Корзина: добавить позицию
+app.post('/api/cart', async (req, res) => {
+  try {
+    const { productId, quantity } = req.body;
+
+    const prodId = Number(productId);
+    const qty = quantity ? Number(quantity) : 1;
+
+    if (!Number.isInteger(prodId) || !(qty > 0)) {
+      return res.status(400).json({ error: 'Invalid productId or quantity' });
+    }
+
+    // проверим, что товар существует
+    const prodRes = await db.query(
+      'SELECT id FROM products WHERE id = $1',
+      [prodId]
+    );
+    if (prodRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const result = await db.query(
+      'INSERT INTO cart_items (product_id, quantity) VALUES ($1, $2) RETURNING *',
+      [prodId, qty]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error('POST /api/cart error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// Корзина: удалить позицию
+app.delete('/api/cart/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Invalid id' });
+  }
+
+  try {
+    await db.query('DELETE FROM cart_items WHERE id = $1', [id]);
+    res.status(204).end();
+  } catch (e) {
+    console.error('DELETE /api/cart/:id error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// Запуск сервера после инициализации БД
+const PORT = process.env.PORT || 3000;
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server started on port ${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('Failed to init DB', err);
+    process.exit(1);
+  });
