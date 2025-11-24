@@ -1,5 +1,6 @@
 // index.js
-// API для каталога изделий + корзина на Node + Postgres (Render)
+// API для каталога изделий + структура + корзина
+// Node + Express + Postgres (Render)
 
 const express = require('express');
 const cors = require('cors');
@@ -10,13 +11,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/**
- * Инициализация БД:
- *  - создаём таблицы, если их нет
- *  - один раз заполняем демо-данными
- */
+// ---------------- ИНИЦИАЛИЗАЦИЯ БД ----------------
+
 async function initDb() {
-  // Таблица изделий
   await db.query(`
     CREATE TABLE IF NOT EXISTS products (
       id SERIAL PRIMARY KEY,
@@ -30,7 +27,6 @@ async function initDb() {
     );
   `);
 
-  // Таблица структуры изделия (сборка → деталь/подсборка/стандарт)
   await db.query(`
     CREATE TABLE IF NOT EXISTS bom_items (
       id SERIAL PRIMARY KEY,
@@ -40,7 +36,6 @@ async function initDb() {
     );
   `);
 
-  // Таблица корзины
   await db.query(`
     CREATE TABLE IF NOT EXISTS cart_items (
       id SERIAL PRIMARY KEY,
@@ -49,13 +44,10 @@ async function initDb() {
     );
   `);
 
-  // Проверяем, есть ли хоть одно изделие
   const countRes = await db.query('SELECT COUNT(*) FROM products');
   const count = Number(countRes.rows[0].count || 0);
 
-  // Если пусто — заполняем демо-набором
   if (count === 0) {
-    // Изделия
     await db.query(`
       INSERT INTO products (code, name, type, mass_kg, length_mm, width_mm, height_mm)
       VALUES
@@ -65,14 +57,12 @@ async function initDb() {
         ('STD-001', 'Подшипник 6205',         'Standard',  0.5,  25,   25,  15); -- id = 4
     `);
 
-    // Структура изделия:
-    // ASM-001 состоит из PRT-001 и PRT-002, а PRT-002 содержит 2 подшипника STD-001
     await db.query(`
       INSERT INTO bom_items (parent_product_id, child_product_id, quantity)
       VALUES
-        (1, 2, 1),  -- ASM-001 → PRT-001
-        (1, 3, 1),  -- ASM-001 → PRT-002
-        (3, 4, 2);  -- PRT-002 → STD-001 (2 шт.)
+        (1, 2, 1),
+        (1, 3, 1),
+        (3, 4, 2);
     `);
 
     console.log('Demo data inserted');
@@ -81,24 +71,22 @@ async function initDb() {
   console.log('DB schema initialized');
 }
 
-/**
- * Маршруты каталога
- */
+// ---------------- ОБЩЕЕ ----------------
 
-// Тестовый корень
 app.get('/', (req, res) => {
   res.send('API is running');
 });
 
-// Список "корневых" изделий: все сборки
+// ---------------- КАТАЛОГ: ПРОДУКТЫ ----------------
+
+// корневые (сборки)
 app.get('/api/products/root', async (req, res) => {
   try {
-    const result = await db.query(
-      `SELECT *
-       FROM products
-       WHERE type = 'Assembly'
-       ORDER BY id;`
-    );
+    const result = await db.query(`
+      SELECT * FROM products
+      WHERE type = 'Assembly'
+      ORDER BY id
+    `);
     res.json(result.rows);
   } catch (e) {
     console.error('GET /api/products/root error:', e);
@@ -106,18 +94,85 @@ app.get('/api/products/root', async (req, res) => {
   }
 });
 
-// Карточка изделия по id
+// карточка по id
 app.get('/api/products/:id', async (req, res) => {
   const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Invalid id' });
+  }
+  try {
+    const result = await db.query(
+      'SELECT * FROM products WHERE id = $1',
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('GET /api/products/:id error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
 
+// ОБНОВЛЕНИЕ продукта (редактирование)
+app.patch('/api/products/:id', async (req, res) => {
+  const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     return res.status(400).json({ error: 'Invalid id' });
   }
 
   try {
+    const {
+      code,
+      name,
+      type,
+      mass_kg,
+      length_mm,
+      width_mm,
+      height_mm
+    } = req.body;
+
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    function addField(name, value) {
+      fields.push(`${name} = $${idx}`);
+      values.push(value);
+      idx++;
+    }
+
+    if (code !== undefined) addField('code', String(code).trim());
+    if (name !== undefined) addField('name', String(name).trim());
+    if (type !== undefined) {
+      const allowed = ['Assembly', 'Part', 'Standard'];
+      if (!allowed.includes(type)) {
+        return res.status(400).json({ error: 'Invalid type' });
+      }
+      addField('type', type);
+    }
+
+    function numOrNull(v) {
+      if (v === undefined || v === null || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    if (mass_kg !== undefined) addField('mass_kg', numOrNull(mass_kg));
+    if (length_mm !== undefined) addField('length_mm', numOrNull(length_mm));
+    if (width_mm !== undefined) addField('width_mm', numOrNull(width_mm));
+    if (height_mm !== undefined) addField('height_mm', numOrNull(height_mm));
+
+    if (fields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    values.push(id);
+
     const result = await db.query(
-      'SELECT * FROM products WHERE id = $1',
-      [id]
+      `UPDATE products SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
     );
 
     if (result.rows.length === 0) {
@@ -126,19 +181,48 @@ app.get('/api/products/:id', async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (e) {
-    console.error('GET /api/products/:id error:', e);
+    console.error('PATCH /api/products/:id error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// Дети (состав) изделия по id сборки
-app.get('/api/products/:id/children', async (req, res) => {
+// УДАЛЕНИЕ продукта (полностью)
+app.delete('/api/products/:id', async (req, res) => {
   const id = Number(req.params.id);
-
   if (!Number.isInteger(id)) {
     return res.status(400).json({ error: 'Invalid id' });
   }
 
+  try {
+    await db.query('BEGIN');
+    await db.query('DELETE FROM cart_items WHERE product_id = $1', [id]);
+    await db.query(
+      'DELETE FROM bom_items WHERE parent_product_id = $1 OR child_product_id = $1',
+      [id]
+    );
+    const result = await db.query('DELETE FROM products WHERE id = $1 RETURNING *', [id]);
+    await db.query('COMMIT');
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    res.status(204).end();
+  } catch (e) {
+    await db.query('ROLLBACK');
+    console.error('DELETE /api/products/:id error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// ---------------- КАТАЛОГ: СОСТАВ (BOM) ----------------
+
+// дети изделия
+app.get('/api/products/:id/children', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Invalid id' });
+  }
   try {
     const result = await db.query(
       `
@@ -156,11 +240,10 @@ app.get('/api/products/:id/children', async (req, res) => {
       FROM bom_items b
       JOIN products c ON c.id = b.child_product_id
       WHERE b.parent_product_id = $1
-      ORDER BY b.id;
+      ORDER BY b.id
       `,
       [id]
     );
-
     res.json(result.rows);
   } catch (e) {
     console.error('GET /api/products/:id/children error:', e);
@@ -168,11 +251,49 @@ app.get('/api/products/:id/children', async (req, res) => {
   }
 });
 
-/**
- * СОЗДАНИЕ НОВОГО УЗЛА (product + связь с родителем)
- * POST /api/nodes
- * body: { parentId?, code, name, type, mass_kg?, length_mm?, width_mm?, height_mm?, quantity? }
- */
+// обновление количества в BOM
+app.patch('/api/bom-items/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Invalid BOM item id' });
+  }
+  const { quantity } = req.body;
+  const qty = Number(quantity);
+  if (!(qty > 0)) {
+    return res.status(400).json({ error: 'Invalid quantity' });
+  }
+  try {
+    const result = await db.query(
+      'UPDATE bom_items SET quantity = $1 WHERE id = $2 RETURNING *',
+      [qty, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'BOM item not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('PATCH /api/bom-items/:id error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// удаление строки из BOM (убрать деталь из сборки)
+app.delete('/api/bom-items/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Invalid BOM item id' });
+  }
+  try {
+    await db.query('DELETE FROM bom_items WHERE id = $1', [id]);
+    res.status(204).end();
+  } catch (e) {
+    console.error('DELETE /api/bom-items/:id error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// ---------------- СОЗДАНИЕ НОВОГО УЗЛА ----------------
+
 app.post('/api/nodes', async (req, res) => {
   try {
     let {
@@ -197,15 +318,18 @@ app.post('/api/nodes', async (req, res) => {
     }
 
     const parentIdNum = parentId ? Number(parentId) : null;
-    const massNum = mass_kg !== undefined && mass_kg !== null && mass_kg !== ''
-      ? Number(mass_kg) : null;
-    const lenNum = length_mm !== undefined && length_mm !== null && length_mm !== ''
-      ? Number(length_mm) : null;
-    const widNum = width_mm !== undefined && width_mm !== null && width_mm !== ''
-      ? Number(width_mm) : null;
-    const heiNum = height_mm !== undefined && height_mm !== null && height_mm !== ''
-      ? Number(height_mm) : null;
-    const qtyNum = quantity !== undefined && quantity !== null && quantity !== ''
+
+    function numOrNull(v) {
+      if (v === undefined || v === null || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    const massNum = numOrNull(mass_kg);
+    const lenNum  = numOrNull(length_mm);
+    const widNum  = numOrNull(width_mm);
+    const heiNum  = numOrNull(height_mm);
+    const qtyNum  = quantity !== undefined && quantity !== null && quantity !== ''
       ? Number(quantity) : 1;
 
     const productRes = await db.query(
@@ -216,13 +340,12 @@ app.post('/api/nodes', async (req, res) => {
         String(code).trim(),
         String(name).trim(),
         type,
-        Number.isFinite(massNum) ? massNum : null,
-        Number.isFinite(lenNum) ? lenNum : null,
-        Number.isFinite(widNum) ? widNum : null,
-        Number.isFinite(heiNum) ? heiNum : null
+        massNum,
+        lenNum,
+        widNum,
+        heiNum
       ]
     );
-
     const product = productRes.rows[0];
 
     if (parentIdNum) {
@@ -241,11 +364,8 @@ app.post('/api/nodes', async (req, res) => {
   }
 });
 
-/**
- * КОРЗИНА
- */
+// ---------------- КОРЗИНА ----------------
 
-// Корзина: получить все позиции
 app.get('/api/cart', async (req, res) => {
   try {
     const result = await db.query(`
@@ -257,9 +377,8 @@ app.get('/api/cart', async (req, res) => {
         p.name
       FROM cart_items c
       JOIN products p ON p.id = c.product_id
-      ORDER BY c.id;
+      ORDER BY c.id
     `);
-
     res.json(result.rows);
   } catch (e) {
     console.error('GET /api/cart error:', e);
@@ -267,11 +386,9 @@ app.get('/api/cart', async (req, res) => {
   }
 });
 
-// Корзина: добавить позицию
 app.post('/api/cart', async (req, res) => {
   try {
     const { productId, quantity } = req.body;
-
     const prodId = Number(productId);
     const qty = quantity ? Number(quantity) : 1;
 
@@ -279,7 +396,6 @@ app.post('/api/cart', async (req, res) => {
       return res.status(400).json({ error: 'Invalid productId or quantity' });
     }
 
-    // проверим, что товар существует
     const prodRes = await db.query(
       'SELECT id FROM products WHERE id = $1',
       [prodId]
@@ -300,13 +416,11 @@ app.post('/api/cart', async (req, res) => {
   }
 });
 
-// Корзина: удалить позицию
 app.delete('/api/cart/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     return res.status(400).json({ error: 'Invalid id' });
   }
-
   try {
     await db.query('DELETE FROM cart_items WHERE id = $1', [id]);
     res.status(204).end();
@@ -316,7 +430,8 @@ app.delete('/api/cart/:id', async (req, res) => {
   }
 });
 
-// Запуск сервера после инициализации БД
+// ---------------- ЗАПУСК ----------------
+
 const PORT = process.env.PORT || 3000;
 
 initDb()
