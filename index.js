@@ -1,5 +1,5 @@
 // index.js
-// Простой API для каталога изделий + корзина на Node + Postgres (Render)
+// API для каталога изделий + корзина на Node + Postgres (Render)
 
 const express = require('express');
 const cors = require('cors');
@@ -82,7 +82,7 @@ async function initDb() {
 }
 
 /**
- * CRUD-маршруты
+ * Маршруты каталога
  */
 
 // Тестовый корень
@@ -90,8 +90,7 @@ app.get('/', (req, res) => {
   res.send('API is running');
 });
 
-// Список "корневых" изделий.
-// В простом варианте возьмём все сборки (type = 'Assembly').
+// Список "корневых" изделий: все сборки
 app.get('/api/products/root', async (req, res) => {
   try {
     const result = await db.query(
@@ -169,87 +168,65 @@ app.get('/api/products/:id/children', async (req, res) => {
   }
 });
 
-// Корзина: получить все позиции
-app.get('/api/cart', async (req, res) => {
+/**
+ * СОЗДАНИЕ НОВОГО УЗЛА (product + связь с родителем)
+ * POST /api/nodes
+ * body: { parentId?, code, name, type, mass_kg?, length_mm?, width_mm?, height_mm?, quantity? }
+ */
+app.post('/api/nodes', async (req, res) => {
   try {
-    const result = await db.query(`
-      SELECT
-        c.id,
-        c.quantity,
-        p.id   AS product_id,
-        p.code,
-        p.name
-      FROM cart_items c
-      JOIN products p ON p.id = c.product_id
-      ORDER BY c.id;
-    `);
+    let {
+      parentId,
+      code,
+      name,
+      type,
+      mass_kg,
+      length_mm,
+      width_mm,
+      height_mm,
+      quantity
+    } = req.body;
 
-    res.json(result.rows);
-  } catch (e) {
-    console.error('GET /api/cart error:', e);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// Корзина: добавить позицию
-app.post('/api/cart', async (req, res) => {
-  try {
-    const { productId, quantity } = req.body;
-
-    const prodId = Number(productId);
-    const qty = quantity ? Number(quantity) : 1;
-
-    if (!Number.isInteger(prodId) || !(qty > 0)) {
-      return res.status(400).json({ error: 'Invalid productId or quantity' });
+    if (!code || !name || !type) {
+      return res.status(400).json({ error: 'code, name и type обязательны' });
     }
 
-    // на всякий случай проверим, что товар существует
-    const prodRes = await db.query(
-      'SELECT id FROM products WHERE id = $1',
-      [prodId]
-    );
-    if (prodRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
+    const allowedTypes = ['Assembly', 'Part', 'Standard'];
+    if (!allowedTypes.includes(type)) {
+      return res.status(400).json({ error: 'type должен быть Assembly | Part | Standard' });
     }
 
-    const result = await db.query(
-      'INSERT INTO cart_items (product_id, quantity) VALUES ($1, $2) RETURNING *',
-      [prodId, qty]
+    const parentIdNum = parentId ? Number(parentId) : null;
+    const massNum = mass_kg !== undefined && mass_kg !== null && mass_kg !== ''
+      ? Number(mass_kg) : null;
+    const lenNum = length_mm !== undefined && length_mm !== null && length_mm !== ''
+      ? Number(length_mm) : null;
+    const widNum = width_mm !== undefined && width_mm !== null && width_mm !== ''
+      ? Number(width_mm) : null;
+    const heiNum = height_mm !== undefined && height_mm !== null && height_mm !== ''
+      ? Number(height_mm) : null;
+    const qtyNum = quantity !== undefined && quantity !== null && quantity !== ''
+      ? Number(quantity) : 1;
+
+    const productRes = await db.query(
+      `INSERT INTO products (code, name, type, mass_kg, length_mm, width_mm, height_mm)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [
+        String(code).trim(),
+        String(name).trim(),
+        type,
+        Number.isFinite(massNum) ? massNum : null,
+        Number.isFinite(lenNum) ? lenNum : null,
+        Number.isFinite(widNum) ? widNum : null,
+        Number.isFinite(heiNum) ? heiNum : null
+      ]
     );
 
-    res.status(201).json(result.rows[0]);
-  } catch (e) {
-    console.error('POST /api/cart error:', e);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
+    const product = productRes.rows[0];
 
-// Корзина: удалить позицию
-app.delete('/api/cart/:id', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'Invalid id' });
-  }
-
-  try {
-    await db.query('DELETE FROM cart_items WHERE id = $1', [id]);
-    res.status(204).end();
-  } catch (e) {
-    console.error('DELETE /api/cart/:id error:', e);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// Запуск сервера после инициализации БД
-const PORT = process.env.PORT || 3000;
-
-initDb()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server started on port ${PORT}`);
-    });
-  })
-  .catch(err => {
-    console.error('Failed to init DB', err);
-    process.exit(1);
-  });
+    if (parentIdNum) {
+      const q = qtyNum > 0 ? qtyNum : 1;
+      await db.query(
+        `INSERT INTO bom_items (parent_product_id, child_product_id, quantity)
+         VALUES ($1, $2, $3)`,
