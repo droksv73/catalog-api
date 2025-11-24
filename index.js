@@ -2,6 +2,39 @@
 //
 // Сервер для "Каталога деталей крана КС-8165".
 // Express + PostgreSQL + JWT + загрузка файлов + статистика хранилища.
+//
+// Таблицы, на которые он рассчитан:
+//
+// products(
+//   id serial primary key,
+//   code text,
+//   name text,
+//   type text,          -- 'Assembly' | 'Part' | 'Standard'
+//   mass_kg numeric,
+//   length_mm numeric,
+//   width_mm numeric,
+//   height_mm numeric
+// )
+//
+// bom_items(
+//   id serial primary key,
+//   parent_id integer references products(id),
+//   product_id integer references products(id),
+//   quantity numeric
+// )
+//
+// cart_items(
+//   id serial primary key,
+//   product_id integer references products(id),
+//   quantity numeric
+// )
+//
+// admins(
+//   id serial primary key,
+//   email text,
+//   password_hash text,
+//   is_admin boolean
+// )
 
 require('dotenv').config();
 
@@ -16,37 +49,36 @@ const fs = require('fs');
 
 const app = express();
 
-// ---------------- НАСТРОЙКИ ----------------
+// --------- НАСТРОЙКИ ---------
 
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_secret';
 
-// Каталог хранения файлов (2D/3D)
+// Каталог для загруженных 2D/3D файлов
 const UPLOAD_ROOT = path.join(__dirname, 'uploads');
-// Лимит хранилища: 2 ГиБ (можно менять)
+// Лимит хранилища: 2 ГиБ
 const STORAGE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
 
-// Создаём каталог файлов, если его нет
 if (!fs.existsSync(UPLOAD_ROOT)) {
   fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
 }
 
-// ---------------- PostgreSQL ----------------
+// --------- PostgreSQL ---------
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
-// ---------------- МИДЛВАРЫ ----------------
+// --------- МИДЛВАРЫ ---------
 
 app.use(cors());
 app.use(express.json());
 
-// Раздача загруженных файлов
+// Раздаём загруженные файлы
 app.use('/uploads', express.static(UPLOAD_ROOT));
 
-// Multer: загрузка файлов
+// Multer — сохранение файлов на диск
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_ROOT),
   filename: (req, file, cb) => {
@@ -57,7 +89,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ---------------- ВСПОМОГАТЕЛЬНЫЕ ----------------
+// --------- ВСПОМОГАТЕЛЬНЫЕ ---------
 
 function generateToken(adminRow) {
   return jwt.sign(
@@ -115,10 +147,10 @@ async function getDirStats(dir) {
   return { totalBytes, fileCount };
 }
 
-// ---------------- АВТОРИЗАЦИЯ АДМИНА ----------------
+// --------- АВТОРИЗАЦИЯ АДМИНА ---------
 //
 // POST /api/auth/login
-// body: { username, password }  (username = email)
+// body: { username, password }  (username = email в таблице admins)
 
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
@@ -151,17 +183,24 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// ---------------- ИЗДЕЛИЯ ----------------
+// --------- ИЗДЕЛИЯ ---------
 //
-// !!! Важно: здесь мы не трогаем BOM, просто отдаём список всех изделий.
-// Логику "подсборки не показывать отдельно" делает фронтенд.
+// Важно: здесь /api/products/root просто отдаёт ВСЕ изделия,
+// а уже фронтенд решает, что показывать отдельно, а что только как подсборку.
 
 app.get('/api/products/root', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
-             image_url, model_url
+      SELECT
+        id,
+        code,
+        name,
+        type,
+        mass_kg,
+        length_mm,
+        width_mm,
+        height_mm
       FROM products
       ORDER BY code
       `
@@ -179,8 +218,15 @@ app.get('/api/products/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
-             image_url, model_url
+      SELECT
+        id,
+        code,
+        name,
+        type,
+        mass_kg,
+        length_mm,
+        width_mm,
+        height_mm
       FROM products
       WHERE id = $1
       `,
@@ -198,7 +244,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// Состав сборки (дети)
+// Состав сборки
 // products.id = bom_items.product_id
 app.get('/api/products/:id/children', async (req, res) => {
   const { id } = req.params;
@@ -215,9 +261,7 @@ app.get('/api/products/:id/children', async (req, res) => {
         p.mass_kg,
         p.length_mm,
         p.width_mm,
-        p.height_mm,
-        p.image_url,
-        p.model_url
+        p.height_mm
       FROM bom_items b
       JOIN products p ON p.id = b.product_id
       WHERE b.parent_id = $1
@@ -262,8 +306,15 @@ app.post('/api/products', authRequired, async (req, res) => {
     const insertProdSql = `
       INSERT INTO products (code, name, type, mass_kg, length_mm, width_mm, height_mm)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
-                image_url, model_url
+      RETURNING
+        id,
+        code,
+        name,
+        type,
+        mass_kg,
+        length_mm,
+        width_mm,
+        height_mm
     `;
 
     const { rows } = await client.query(insertProdSql, [
@@ -280,9 +331,10 @@ app.post('/api/products', authRequired, async (req, res) => {
 
     // Если задан parentId — добавляем строку в BOM
     if (parentId) {
-      const qty = quantityInParent && Number(quantityInParent) > 0
-        ? Number(quantityInParent)
-        : 1;
+      const qty =
+        quantityInParent && Number(quantityInParent) > 0
+          ? Number(quantityInParent)
+          : 1;
 
       await client.query(
         `
@@ -325,16 +377,24 @@ app.put('/api/products/:id', authRequired, async (req, res) => {
     const { rows } = await pool.query(
       `
       UPDATE products
-      SET code      = $1,
-          name      = $2,
-          type      = $3,
-          mass_kg   = $4,
-          length_mm = $5,
-          width_mm  = $6,
-          height_mm = $7
-      WHERE id = $8
-      RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm,
-                image_url, model_url
+      SET
+        code      = $1,
+        name      = $2,
+        type      = $3,
+        mass_kg   = $4,
+        length_mm = $5,
+        width_mm  = $6,
+        height_mm = $7
+      WHERE id   = $8
+      RETURNING
+        id,
+        code,
+        name,
+        type,
+        mass_kg,
+        length_mm,
+        width_mm,
+        height_mm
       `,
       [
         code,
@@ -359,7 +419,7 @@ app.put('/api/products/:id', authRequired, async (req, res) => {
   }
 });
 
-// Удаление позиции BOM (строки состава)
+// Удаление позиции BOM
 app.delete('/api/bom/:id', authRequired, async (req, res) => {
   if (!req.user || !req.user.isAdmin) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -375,10 +435,15 @@ app.delete('/api/bom/:id', authRequired, async (req, res) => {
   }
 });
 
-// ---------------- ЗАГРУЗКА ФАЙЛОВ ----------------
+// --------- ЗАГРУЗКА ФАЙЛОВ 2D/3D ---------
 //
 // POST /api/products/:id/media
 // form-data: file=<file>, kind=image|model
+//
+// ВНИМАНИЕ: этот эндпоинт пока НЕ пишет ничего в БД,
+// он только сохраняет файл на диске и возвращает URL.
+// При перезагрузке страницы фронт про этот файл не знает —
+// полноценная привязка файла к изделию требует доработки схемы БД.
 
 app.post(
   '/api/products/:id/media',
@@ -390,9 +455,7 @@ app.post(
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { id } = req.params;
     const { kind } = req.body || {};
-
     if (!req.file || !kind) {
       if (req.file) fs.unlink(req.file.path, () => {});
       return res.status(400).json({ error: 'file and kind are required' });
@@ -403,31 +466,13 @@ app.post(
       return res.status(400).json({ error: 'kind must be image or model' });
     }
 
+    // Просто отдаём URL сохранённого файла
     const url = `/uploads/${req.file.filename}`;
-
-    try {
-      if (kind === 'image') {
-        await pool.query(
-          'UPDATE products SET image_url = $1 WHERE id = $2',
-          [url, id]
-        );
-      } else {
-        await pool.query(
-          'UPDATE products SET model_url = $1 WHERE id = $2',
-          [url, id]
-        );
-      }
-
-      res.json({ url });
-    } catch (e) {
-      console.error('media update error', e);
-      if (req.file) fs.unlink(req.file.path, () => {});
-      res.status(500).json({ error: 'Failed to save media' });
-    }
+    res.json({ url, kind });
   }
 );
 
-// ---------------- КОРЗИНА ----------------
+// --------- КОРЗИНА ---------
 
 // GET /api/cart
 app.get('/api/cart', async (req, res) => {
@@ -499,7 +544,7 @@ app.delete('/api/cart/:id', async (req, res) => {
   }
 });
 
-// ---------------- АДМИН: ХРАНИЛИЩЕ ----------------
+// --------- АДМИН: СТАТИСТИКА ХРАНИЛИЩА ---------
 //
 // GET /api/admin/storage  (только админ)
 
@@ -526,13 +571,13 @@ app.get('/api/admin/storage', authRequired, async (req, res) => {
   }
 });
 
-// ---------------- ПРОВЕРОЧНЫЙ РУТ ----------------
+// --------- ПРОВЕРОЧНЫЙ РУТ ---------
 
 app.get('/', (req, res) => {
   res.send('API is running');
 });
 
-// ---------------- СТАРТ СЕРВЕРА ----------------
+// --------- СТАРТ СЕРВЕРА ---------
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
