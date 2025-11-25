@@ -102,22 +102,27 @@ app.get('/api/health', async (req, res) => {
 // ---------- каталожные маршруты (чтение, публичные) ----------
 
 // GET /api/products/root – корень дерева (изделия без родителей в BOM)
+// Корень дерева каталога
 app.get('/api/products/root', async (req, res) => {
   try {
-    const result = await dbQuery(
-      `
-      SELECT p.id, p.code, p.name, p.type,
-             p.mass_kg, p.length_mm, p.width_mm, p.height_mm
-      FROM products p
-      LEFT JOIN bom_items b ON p.id = b.child_id
-      WHERE b.child_id IS NULL
-      ORDER BY p.code;
-      `
+    // Берём все сборочные единицы как корень дерева
+    const result = await pool.query(
+      `SELECT id,
+              code,
+              name,
+              type,
+              mass_kg,
+              length_mm,
+              width_mm,
+              height_mm
+       FROM products
+       WHERE type = 'Assembly'
+       ORDER BY code`
     );
 
     res.json(result.rows);
   } catch (err) {
-    console.error('Ошибка /api/products/root', err);
+    console.error('Ошибка загрузки корня дерева:', err);
     res.status(500).json({ error: 'Ошибка загрузки корня дерева' });
   }
 });
