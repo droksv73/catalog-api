@@ -1,5 +1,4 @@
 // index.js – API для каталога крана КС-8165 (интернет-версия)
-
 import express from 'express';
 import cors from 'cors';
 import pkg from 'pg';
