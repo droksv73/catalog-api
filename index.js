@@ -5,11 +5,18 @@ import cors from 'cors';
 import pkg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const { Pool } = pkg;
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+// ---------- ПУТИ ----------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ---------- БАЗА ДАННЫХ ----------
 const pool = new Pool({
@@ -23,6 +30,9 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 
+// раздаём загруженные файлы
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 // маленький хелпер для логов
 function logError(place, err) {
   console.error(`[${place}]`, err.message, err.stack);
@@ -30,7 +40,7 @@ function logError(place, err) {
 
 // ---------- АУТЕНТИФИКАЦИЯ АДМИНА ----------
 
-const ADMIN_USER = process.env.ADMIN_USER || 'dro.ksv73@gmail.com';
+const ADMIN_USER = process.env.ADMIN_USER || 'admin@example.com';
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
@@ -47,6 +57,10 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(401).json({ error: 'Неверный логин или пароль' });
     }
 
+    if (!ADMIN_PASSWORD_HASH) {
+      return res.status(500).json({ error: 'Пароль администратора не настроен' });
+    }
+
     const ok = await bcrypt.compare(password, ADMIN_PASSWORD_HASH);
     if (!ok) {
       return res.status(401).json({ error: 'Неверный логин или пароль' });
@@ -60,7 +74,7 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// мидлвар для эндпоинтов, где нужна админ-права
+// мидлвар для эндпоинтов, где нужны админ-права
 function requireAdmin(req, res, next) {
   const header = req.headers.authorization || '';
   const [, token] = header.split(' ');
@@ -83,13 +97,25 @@ function requireAdmin(req, res, next) {
 
 // ---------- ПРОДУКТЫ ----------
 
+const PRODUCT_FIELDS = `
+  p.id,
+  p.code,
+  p.name,
+  p.type,
+  p.mass_kg,
+  p.length_mm,
+  p.width_mm,
+  p.height_mm,
+  p.image2d_url,
+  p.model3d_url
+`;
+
 // GET /api/products/root – элементы верхнего уровня дерева
 app.get('/api/products/root', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT p.id, p.code, p.name, p.type,
-             p.mass_kg, p.length_mm, p.width_mm, p.height_mm
+      SELECT ${PRODUCT_FIELDS}
       FROM products p
       WHERE NOT EXISTS (
         SELECT 1
@@ -102,7 +128,7 @@ app.get('/api/products/root', async (req, res) => {
     res.json(rows);
   } catch (err) {
     logError('products/root', err);
-    res.status(500).json({ error: 'Ошибка загрузки корня дерева' });
+    res.status(500).json({ error: 'Ошибка загрузки дерева изделий' });
   }
 });
 
@@ -116,18 +142,15 @@ app.get('/api/products/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT id, code, name, type,
-             mass_kg, length_mm, width_mm, height_mm
-      FROM products
-      WHERE id = $1
+      SELECT ${PRODUCT_FIELDS}
+      FROM products p
+      WHERE p.id = $1
       `,
       [id]
     );
-
-    if (rows.length === 0) {
+    if (!rows.length) {
       return res.status(404).json({ error: 'Изделие не найдено' });
     }
-
     res.json(rows[0]);
   } catch (err) {
     logError('products/:id', err);
@@ -135,8 +158,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// !!! ВАЖНО: состав сборки – здесь как раз твоя ошибка была !!!
-// GET /api/products/:id/children – дети (состав сборки)
+// GET /api/products/:id/children – состав сборки
 app.get('/api/products/:id/children', async (req, res) => {
   const parentId = Number(req.params.id);
   if (!Number.isInteger(parentId)) {
@@ -147,34 +169,34 @@ app.get('/api/products/:id/children', async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        b.id            AS bom_item_id,
-        b.quantity      AS quantity,
-        p.id,
+        b.id,
+        b.parent_product_id,
+        b.child_product_id AS product_id,
+        b.quantity,
         p.code,
         p.name,
         p.type,
         p.mass_kg,
         p.length_mm,
         p.width_mm,
-        p.height_mm
-      FROM bom_items b                          -- ТАБЛИЦА СОСТАВА
+        p.height_mm,
+        p.image2d_url,
+        p.model3d_url
+      FROM bom_items b
       JOIN products p ON p.id = b.child_product_id
-      WHERE b.parent_product_id = $1           -- РОДИТЕЛЬСКАЯ СБОРКА
+      WHERE b.parent_product_id = $1
       ORDER BY b.id
       `,
       [parentId]
     );
-
     res.json(rows);
   } catch (err) {
     logError('products/:id/children', err);
-    res.status(500).json({ error: 'Ошибка загрузки состава сборки' });
+    res.status(500).json({ error: 'Ошибка загрузки состава' });
   }
 });
 
-// ---------- CRUD ДЛЯ ПРОДУКТОВ (админ-режим) ----------
-
-// POST /api/products – создать
+// POST /api/products – создать изделие
 app.post('/api/products', requireAdmin, async (req, res) => {
   try {
     const {
@@ -184,20 +206,23 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       mass_kg = null,
       length_mm = null,
       width_mm = null,
-      height_mm = null
+      height_mm = null,
+      image2d_url = null,
+      model3d_url = null
     } = req.body || {};
 
     if (!code || !name || !type) {
-      return res.status(400).json({ error: 'Не указаны обязательные поля' });
+      return res.status(400).json({ error: 'Не заполнены обязательные поля (код, наименование, тип)' });
     }
 
     const { rows } = await pool.query(
       `
-      INSERT INTO products (code, name, type, mass_kg, length_mm, width_mm, height_mm)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm
+      INSERT INTO products
+        (code, name, type, mass_kg, length_mm, width_mm, height_mm, image2d_url, model3d_url)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING ${PRODUCT_FIELDS}
       `,
-      [code, name, type, mass_kg, length_mm, width_mm, height_mm]
+      [code, name, type, mass_kg, length_mm, width_mm, height_mm, image2d_url, model3d_url]
     );
 
     res.status(201).json(rows[0]);
@@ -216,43 +241,48 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
 
   try {
     const {
-      code,
-      name,
-      type,
+      code = null,
+      name = null,
+      type = null,
       mass_kg = null,
       length_mm = null,
       width_mm = null,
-      height_mm = null
+      height_mm = null,
+      image2d_url = null,
+      model3d_url = null
     } = req.body || {};
 
     const { rows } = await pool.query(
       `
       UPDATE products
-      SET code       = $1,
-          name       = $2,
-          type       = $3,
-          mass_kg    = $4,
-          length_mm  = $5,
-          width_mm   = $6,
-          height_mm  = $7
-      WHERE id = $8
-      RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm
+      SET
+        code        = COALESCE($1, code),
+        name        = COALESCE($2, name),
+        type        = COALESCE($3, type),
+        mass_kg     = COALESCE($4, mass_kg),
+        length_mm   = COALESCE($5, length_mm),
+        width_mm    = COALESCE($6, width_mm),
+        height_mm   = COALESCE($7, height_mm),
+        image2d_url = COALESCE($8, image2d_url),
+        model3d_url = COALESCE($9, model3d_url)
+      WHERE id = $10
+      RETURNING ${PRODUCT_FIELDS}
       `,
-      [code, name, type, mass_kg, length_mm, width_mm, height_mm, id]
+      [code, name, type, mass_kg, length_mm, width_mm, height_mm, image2d_url, model3d_url, id]
     );
 
-    if (rows.length === 0) {
+    if (!rows.length) {
       return res.status(404).json({ error: 'Изделие не найдено' });
     }
 
     res.json(rows[0]);
   } catch (err) {
     logError('PUT /products/:id', err);
-    res.status(500).json({ error: 'Ошибка сохранения изделия' });
+    res.status(500).json({ error: 'Ошибка обновления изделия' });
   }
 });
 
-// DELETE /api/products/:id – удалить изделие и его состав
+// DELETE /api/products/:id – удалить изделие и связи
 app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
@@ -260,26 +290,23 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 
   try {
-    // удаляем все строки состава, где это изделие родитель или ребёнок
-    await pool.query(
+    await pool.query('DELETE FROM bom_items WHERE parent_product_id = $1 OR child_product_id = $1', [id]);
+    await pool.query('DELETE FROM cart_items WHERE product_id = $1', [id]);
+
+    const { rows } = await pool.query(
       `
-      DELETE FROM bom_items
-      WHERE parent_product_id = $1
-         OR child_product_id  = $1
+      DELETE FROM products
+      WHERE id = $1
+      RETURNING ${PRODUCT_FIELDS}
       `,
       [id]
     );
 
-    const { rowCount } = await pool.query(
-      `DELETE FROM products WHERE id = $1`,
-      [id]
-    );
-
-    if (rowCount === 0) {
+    if (!rows.length) {
       return res.status(404).json({ error: 'Изделие не найдено' });
     }
 
-    res.json({ success: true });
+    res.json(rows[0]);
   } catch (err) {
     logError('DELETE /products/:id', err);
     res.status(500).json({ error: 'Ошибка удаления изделия' });
@@ -312,7 +339,7 @@ app.post('/api/bom', requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE /api/bom/:id – удалить строку состава
+// DELETE /api/bom/:id – удалить строку из состава
 app.delete('/api/bom/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
@@ -324,19 +351,19 @@ app.delete('/api/bom/:id', requireAdmin, async (req, res) => {
       `DELETE FROM bom_items WHERE id = $1`,
       [id]
     );
-    if (rowCount === 0) {
+    if (!rowCount) {
       return res.status(404).json({ error: 'Строка состава не найдена' });
     }
     res.json({ success: true });
   } catch (err) {
     logError('DELETE /bom/:id', err);
-    res.status(500).json({ error: 'Ошибка удаления из состава' });
+    res.status(500).json({ error: 'Ошибка удаления строки состава' });
   }
 });
 
 // ---------- КОРЗИНА ----------
 
-// GET /api/cart
+// GET /api/cart – список позиций (с данными изделия)
 app.get('/api/cart', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -344,9 +371,13 @@ app.get('/api/cart', async (req, res) => {
       SELECT
         c.id,
         c.quantity,
-        p.id        AS product_id,
+        p.id   AS product_id,
         p.code,
-        p.name
+        p.name,
+        p.mass_kg,
+        p.length_mm,
+        p.width_mm,
+        p.height_mm
       FROM cart_items c
       JOIN products p ON p.id = c.product_id
       ORDER BY c.id
@@ -359,7 +390,7 @@ app.get('/api/cart', async (req, res) => {
   }
 });
 
-// POST /api/cart – добавить в корзину { productId, quantity }
+// Базовый POST /api/cart – добавить позицию
 app.post('/api/cart', async (req, res) => {
   try {
     const { productId, quantity = 1 } = req.body || {};
@@ -375,7 +406,6 @@ app.post('/api/cart', async (req, res) => {
       `,
       [productId, quantity]
     );
-
     res.status(201).json(rows[0]);
   } catch (err) {
     logError('POST /cart', err);
@@ -383,7 +413,30 @@ app.post('/api/cart', async (req, res) => {
   }
 });
 
-// DELETE /api/cart/:id – удалить позицию
+// Алиас под фронтенд: POST /api/cart/add
+app.post('/api/cart/add', async (req, res) => {
+  try {
+    const { productId, quantity = 1 } = req.body || {};
+    if (!productId) {
+      return res.status(400).json({ error: 'Не указан productId' });
+    }
+
+    const { rows } = await pool.query(
+      `
+      INSERT INTO cart_items (product_id, quantity)
+      VALUES ($1,$2)
+      RETURNING id, product_id, quantity
+      `,
+      [productId, quantity]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    logError('POST /cart/add', err);
+    res.status(500).json({ error: 'Ошибка добавления в корзину' });
+  }
+});
+
+// DELETE /api/cart/:id – удалить строку
 app.delete('/api/cart/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
@@ -395,17 +448,17 @@ app.delete('/api/cart/:id', async (req, res) => {
       `DELETE FROM cart_items WHERE id = $1`,
       [id]
     );
-    if (rowCount === 0) {
-      return res.status(404).json({ error: 'Позиция не найдена' });
+    if (!rowCount) {
+      return res.status(404).json({ error: 'Позиция корзины не найдена' });
     }
     res.json({ success: true });
   } catch (err) {
     logError('DELETE /cart/:id', err);
-    res.status(500).json({ error: 'Ошибка удаления из корзины' });
+    res.status(500).json({ error: 'Ошибка удаления позиции корзины' });
   }
 });
 
-// DELETE /api/cart – полностью очистить корзину
+// DELETE /api/cart – очистить корзину
 app.delete('/api/cart', async (req, res) => {
   try {
     await pool.query(`DELETE FROM cart_items`);
@@ -413,6 +466,212 @@ app.delete('/api/cart', async (req, res) => {
   } catch (err) {
     logError('DELETE /cart', err);
     res.status(500).json({ error: 'Ошибка очистки корзины' });
+  }
+});
+
+// Алиас под фронтенд: DELETE /api/cart/clear
+app.delete('/api/cart/clear', async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM cart_items`);
+    res.json({ success: true });
+  } catch (err) {
+    logError('DELETE /cart/clear', err);
+    res.status(500).json({ error: 'Ошибка очистки корзины' });
+  }
+});
+
+// ---------- ЗАКАЗЫ ----------
+// Ожидаются таблицы:
+//  orders(id serial PK, created_at timestamptz default now(), customer_name, customer_email, customer_phone, order_number, comment)
+//  order_items(id serial PK, order_id int FK, product_id int FK, quantity int)
+
+app.post('/api/orders', async (req, res) => {
+  const {
+    customer_name = null,
+    customer_email = null,
+    customer_phone = null,
+    order_number = null,
+    comment = null
+  } = req.body || {};
+
+  if (!customer_name || (!customer_email && !customer_phone)) {
+    return res.status(400).json({ error: 'Необходимо указать заказчика и контакты (телефон или email)' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: cartItems } = await client.query(
+      `
+      SELECT product_id, quantity
+      FROM cart_items
+      ORDER BY id
+      `
+    );
+
+    if (!cartItems.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Корзина пуста' });
+    }
+
+    const generatedNumber =
+      order_number ||
+      'ORD-' + Math.floor(Date.now() / 1000).toString();
+
+    const { rows: orderRows } = await client.query(
+      `
+      INSERT INTO orders
+        (customer_name, customer_email, customer_phone, order_number, comment)
+      VALUES ($1,$2,$3,$4,$5)
+      RETURNING id, created_at, customer_name, customer_email, customer_phone, order_number, comment
+      `,
+      [customer_name, customer_email, customer_phone, generatedNumber, comment]
+    );
+    const order = orderRows[0];
+
+    for (const item of cartItems) {
+      await client.query(
+        `
+        INSERT INTO order_items (order_id, product_id, quantity)
+        VALUES ($1,$2,$3)
+        `,
+        [order.id, item.product_id, item.quantity]
+      );
+    }
+
+    await client.query('DELETE FROM cart_items');
+    await client.query('COMMIT');
+
+    res.status(201).json({ order, items: cartItems });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logError('POST /orders', err);
+    res.status(500).json({ error: 'Ошибка оформления заказа' });
+  } finally {
+    client.release();
+  }
+});
+
+// Опционально: просмотр одного заказа
+app.get('/api/orders/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Некорректный ID заказа' });
+  }
+
+  try {
+    const { rows: orderRows } = await pool.query(
+      `
+      SELECT id, created_at, customer_name, customer_email, customer_phone, order_number, comment
+      FROM orders
+      WHERE id = $1
+      `,
+      [id]
+    );
+    if (!orderRows.length) {
+      return res.status(404).json({ error: 'Заказ не найден' });
+    }
+
+    const { rows: itemRows } = await pool.query(
+      `
+      SELECT
+        oi.id,
+        oi.product_id,
+        oi.quantity,
+        p.code,
+        p.name
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = $1
+      ORDER BY oi.id
+      `,
+      [id]
+    );
+
+    res.json({ order: orderRows[0], items: itemRows });
+  } catch (err) {
+    logError('GET /orders/:id', err);
+    res.status(500).json({ error: 'Ошибка загрузки заказа' });
+  }
+});
+
+// ---------- ЗАГРУЗКА ФАЙЛОВ (2D/3D) ----------
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, path.join(__dirname, 'uploads'));
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    const base = path.basename(file.originalname, ext).replace(/\s+/g, '_');
+    cb(null, `${Date.now()}_${base}${ext}`);
+  }
+});
+
+const upload = multer({ storage });
+
+// POST /api/products/:id/image2d – загрузка 2D изображения
+app.post('/api/products/:id/image2d', requireAdmin, upload.single('file'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Некорректный ID' });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'Файл не передан' });
+  }
+
+  const url = `/uploads/${req.file.filename}`;
+
+  try {
+    const { rows } = await pool.query(
+      `
+      UPDATE products
+      SET image2d_url = $1
+      WHERE id = $2
+      RETURNING ${PRODUCT_FIELDS}
+      `,
+      [url, id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Изделие не найдено' });
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    logError('POST /products/:id/image2d', err);
+    res.status(500).json({ error: 'Ошибка сохранения 2D изображения' });
+  }
+});
+
+// POST /api/products/:id/model3d – загрузка 3D модели
+app.post('/api/products/:id/model3d', requireAdmin, upload.single('file'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Некорректный ID' });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'Файл не передан' });
+  }
+
+  const url = `/uploads/${req.file.filename}`;
+
+  try {
+    const { rows } = await pool.query(
+      `
+      UPDATE products
+      SET model3d_url = $1
+      WHERE id = $2
+      RETURNING ${PRODUCT_FIELDS}
+      `,
+      [url, id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Изделие не найдено' });
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    logError('POST /products/:id/model3d', err);
+    res.status(500).json({ error: 'Ошибка сохранения 3D модели' });
   }
 });
 
