@@ -1,57 +1,51 @@
-// index.js
-// API каталога для интернета с админ-режимом
+// index.js  — основной сервер API для Render
 
 const express = require('express');
 const cors = require('cors');
-const bcrypt = require('bcrypt');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const pool = require('./db'); // подключение к Postgres (как было в db.js)
+
+// ---------------------- Базовая настройка ----------------------
 
 const app = express();
+const PORT = process.env.PORT || 10000;
 
-// --- базовая настройка ---
 app.use(cors());
 app.use(express.json());
 
-// --- конфиг админа из переменных окружения Render ---
-const ADMIN_USER = process.env.ADMIN_USER;                 // dro.ksv73@gmail.com
-const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt-хэш
+// Подключение к БД
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false }
+    : false,
+});
+
+// Небольшой helper, чтобы не падать с некрасивыми 500 без логов
+function sendError(res, message, err, status = 500) {
+  console.error(message, err);
+  res.status(status).json({ error: message });
+}
+
+// Простейший health-check
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+// ---------------------- Авторизация админа ----------------------
+
+const ADMIN_USER = process.env.ADMIN_USER;
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
-// ====== вспомогательные функции ======
-
-function createAdminToken(email) {
-  return jwt.sign({ sub: 'admin', email }, JWT_SECRET, { expiresIn: '8h' });
-}
-
-function requireAdmin(req, res, next) {
-  const auth = req.headers['authorization'];
-  if (!auth || !auth.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Требуется авторизация администратора' });
-  }
-
-  const token = auth.slice(7);
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload.sub !== 'admin') {
-      throw new Error('not admin');
-    }
-    req.admin = payload;
-    next();
-  } catch (e) {
-    console.error('JWT error:', e.message);
-    return res.status(401).json({ error: 'Неверный или просроченный токен' });
-  }
-}
-
-// ====== авторизация администратора ======
-
+// POST /api/admin/login  { email, password }
 app.post('/api/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Не указан логин или пароль' });
+      return res.status(400).json({ error: 'E-mail и пароль обязательны' });
     }
 
     if (email !== ADMIN_USER) {
@@ -63,117 +57,181 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(401).json({ error: 'Неверный логин или пароль' });
     }
 
-    const token = createAdminToken(email);
+    const token = jwt.sign({ role: 'admin' }, JWT_SECRET, {
+      expiresIn: '8h',
+    });
+
     res.json({ token });
   } catch (err) {
-    console.error('Admin login error:', err);
-    res.status(500).json({ error: 'Ошибка авторизации администратора' });
+    sendError(res, 'Ошибка авторизации администратора', err);
   }
 });
 
-// ====== ЧТЕНИЕ КАТАЛОГА (общедоступно) ======
+// GET /api/admin/verify  (Authorization: Bearer <token>)
+app.get('/api/admin/verify', (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    const [, token] = auth.split(' ');
 
-// Корневые изделия (верхний уровень дерева)
+    if (!token) {
+      return res.status(401).json({ error: 'Токен не найден' });
+    }
+
+    jwt.verify(token, JWT_SECRET);
+    res.json({ ok: true });
+  } catch (err) {
+    return res.status(401).json({ error: 'Невалидный токен' });
+  }
+});
+
+// middleware для защищённых маршрутов
+function requireAdmin(req, res, next) {
+  try {
+    const auth = req.headers.authorization || '';
+    const [, token] = auth.split(' ');
+
+    if (!token) {
+      return res.status(401).json({ error: 'Токен не найден' });
+    }
+
+    jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Невалидный токен' });
+  }
+}
+
+// ---------------------- Маршруты изделий ----------------------
+
+// GET /api/products/root  — список всех изделий (корень дерева)
 app.get('/api/products/root', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT p.*
-         FROM products p
-        WHERE NOT EXISTS (
-              SELECT 1
-                FROM bom_items bi
-               WHERE bi.child_product_id = p.id
-              )
-        ORDER BY p.id`
+      `SELECT id, code, name, type, mass_kg, length_mm, width_mm, height_mm
+       FROM products
+       ORDER BY id`
     );
     res.json(result.rows);
   } catch (err) {
-    console.error('Failed to load root products:', err);
-    res.status(500).json({ error: 'Failed to load root products' });
+    sendError(res, 'Не удалось загрузить корневые изделия', err);
   }
 });
 
-// Состав изделия
-app.get('/api/products/:id/children', async (req, res) => {
-  const { id } = req.params;
+// GET /api/products/:id  — карточка изделия
+app.get('/api/products/:id', async (req, res) => {
   try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: 'Некорректный ID' });
+    }
+
     const result = await pool.query(
-      `SELECT bi.id AS bom_item_id,
-              bi.quantity,
-              p.*
-         FROM bom_items bi
-         JOIN products p ON p.id = bi.child_product_id
-        WHERE bi.parent_product_id = $1
-        ORDER BY bi.id`,
+      `SELECT id, code, name, type, mass_kg, length_mm, width_mm, height_mm
+       FROM products
+       WHERE id = $1`,
       [id]
     );
-    res.json(result.rows);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Изделие не найдено' });
+    }
+
+    res.json(result.rows[0]);
   } catch (err) {
-    console.error('Failed to load children for product', id, err);
-    res.status(500).json({ error: 'Ошибка загрузки состава' });
+    sendError(res, 'Ошибка загрузки карточки изделия', err);
   }
 });
 
-// Корзина (как было)
-app.get('/api/cart', async (req, res) => {
+// GET /api/products/:id/children  — состав сборки
+app.get('/api/products/:id/children', async (req, res) => {
   try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: 'Некорректный ID сборки' });
+    }
+
     const result = await pool.query(
-      `SELECT c.id,
-              c.product_id,
-              c.quantity,
-              p.code,
-              p.name
-         FROM cart_items c
-         JOIN products p ON p.id = c.product_id
-        ORDER BY c.id`
+      `SELECT
+          bi.id            AS bom_item_id,
+          bi.quantity      AS quantity,
+          p.id             AS product_id,
+          p.code,
+          p.name,
+          p.type,
+          p.mass_kg,
+          p.length_mm,
+          p.width_mm,
+          p.height_mm
+       FROM bom_items bi
+       JOIN products p ON p.id = bi.product_id
+       WHERE bi.assembly_id = $1
+       ORDER BY bi.id`,
+      [id]
     );
+
     res.json(result.rows);
   } catch (err) {
-    console.error('Load cart error:', err);
-    res.status(500).json({ error: 'Ошибка загрузки корзины' });
+    sendError(res, 'Ошибка загрузки состава сборки', err);
   }
 });
 
-// Здесь при необходимости можно оставить существующие POST/DELETE для корзины.
-
-// ====== ОПЕРАЦИИ ДЛЯ АДМИНА (CRUD) ======
-
-// Создать новое изделие
+// POST /api/products  — создать новое изделие (только админ)
 app.post('/api/products', requireAdmin, async (req, res) => {
-  const { code, name, type, mass_kg, length_mm, width_mm, height_mm } = req.body;
-
   try {
+    const {
+      code,
+      name,
+      type,
+      mass_kg,
+      length_mm,
+      width_mm,
+      height_mm,
+    } = req.body;
+
     const result = await pool.query(
       `INSERT INTO products
          (code, name, type, mass_kg, length_mm, width_mm, height_mm)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-    RETURNING *`,
+       VALUES
+         ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm`,
       [code, name, type, mass_kg, length_mm, width_mm, height_mm]
     );
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    console.error('Create product error:', err);
-    res.status(500).json({ error: 'Ошибка создания изделия' });
+    sendError(res, 'Ошибка создания изделия', err);
   }
 });
 
-// Обновить изделие
+// PUT /api/products/:id  — обновить изделие (только админ)
 app.put('/api/products/:id', requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { code, name, type, mass_kg, length_mm, width_mm, height_mm } = req.body;
-
   try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: 'Некорректный ID' });
+    }
+
+    const {
+      code,
+      name,
+      type,
+      mass_kg,
+      length_mm,
+      width_mm,
+      height_mm,
+    } = req.body;
+
     const result = await pool.query(
       `UPDATE products
-          SET code = $1,
-              name = $2,
-              type = $3,
-              mass_kg = $4,
-              length_mm = $5,
-              width_mm = $6,
-              height_mm = $7
-        WHERE id = $8
-     RETURNING *`,
+         SET code = $1,
+             name = $2,
+             type = $3,
+             mass_kg = $4,
+             length_mm = $5,
+             width_mm = $6,
+             height_mm = $7
+       WHERE id = $8
+       RETURNING id, code, name, type, mass_kg, length_mm, width_mm, height_mm`,
       [code, name, type, mass_kg, length_mm, width_mm, height_mm, id]
     );
 
@@ -183,108 +241,118 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Update product error:', err);
-    res.status(500).json({ error: 'Ошибка обновления изделия' });
+    sendError(res, 'Ошибка обновления изделия', err);
   }
 });
 
-// Удалить изделие (вместе с его связями в составе)
+// DELETE /api/products/:id — удалить изделие (только админ)
+// Перед удалением чистим ссылки из bom_items и cart_items, чтобы не было 500 по внешнему ключу
 app.delete('/api/products/:id', requireAdmin, async (req, res) => {
-  const { id } = req.params;
-
+  const client = await pool.connect();
   try {
-    await pool.query('BEGIN');
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      client.release();
+      return res.status(400).json({ error: 'Некорректный ID' });
+    }
 
-    // удаляем связи, где изделие участвует
-    await pool.query(
-      'DELETE FROM bom_items WHERE parent_product_id = $1 OR child_product_id = $1',
+    await client.query('BEGIN');
+
+    // удаляем из состава всех сборок
+    await client.query(
+      'DELETE FROM bom_items WHERE assembly_id = $1 OR product_id = $1',
       [id]
     );
 
-    const result = await pool.query('DELETE FROM products WHERE id = $1', [id]);
+    // удаляем из корзины
+    await client.query('DELETE FROM cart_items WHERE product_id = $1', [id]);
 
-    await pool.query('COMMIT');
+    // само изделие
+    const result = await client.query(
+      'DELETE FROM products WHERE id = $1 RETURNING id',
+      [id]
+    );
+
+    await client.query('COMMIT');
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Изделие не найдено' });
     }
 
-    res.json({ success: true });
+    res.json({ ok: true });
   } catch (err) {
-    await pool.query('ROLLBACK');
-    console.error('Delete product error:', err);
-    res.status(500).json({ error: 'Ошибка удаления изделия' });
+    await pool.query('ROLLBACK').catch(() => {});
+    sendError(res, 'Ошибка удаления изделия', err);
+  } finally {
+    client.release();
   }
 });
 
-// Добавить позицию в состав
-app.post('/api/products/:id/children', requireAdmin, async (req, res) => {
-  const { id } = req.params; // parent id
-  const { child_product_id, quantity } = req.body;
+// ---------------------- Корзина ----------------------
 
+// GET /api/cart
+app.get('/api/cart', async (req, res) => {
   try {
     const result = await pool.query(
-      `INSERT INTO bom_items (parent_product_id, child_product_id, quantity)
-       VALUES ($1, $2, $3)
-    RETURNING *`,
-      [id, child_product_id, quantity]
+      `SELECT
+          c.id,
+          c.product_id,
+          c.quantity,
+          p.code,
+          p.name
+       FROM cart_items c
+       JOIN products p ON p.id = c.product_id
+       ORDER BY c.id`
     );
+    res.json(result.rows);
+  } catch (err) {
+    sendError(res, 'Ошибка загрузки корзины', err);
+  }
+});
+
+// POST /api/cart  { product_id, quantity }
+app.post('/api/cart', async (req, res) => {
+  try {
+    const { product_id, quantity } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO cart_items (product_id, quantity)
+       VALUES ($1, $2)
+       RETURNING id, product_id, quantity`,
+      [product_id, quantity]
+    );
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    console.error('Add BOM item error:', err);
-    res.status(500).json({ error: 'Ошибка добавления позиции состава' });
+    sendError(res, 'Ошибка добавления в корзину', err);
   }
 });
 
-// Обновить количество в составе
-app.put('/api/bom-items/:id', requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { quantity } = req.body;
-
+// DELETE /api/cart/:id
+app.delete('/api/cart/:id', async (req, res) => {
   try {
-    const result = await pool.query(
-      `UPDATE bom_items
-          SET quantity = $1
-        WHERE id = $2
-     RETURNING *`,
-      [quantity, id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Позиция состава не найдена' });
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: 'Некорректный ID позиции корзины' });
     }
 
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Update BOM item error:', err);
-    res.status(500).json({ error: 'Ошибка обновления позиции состава' });
-  }
-});
-
-// Удалить позицию состава
-app.delete('/api/bom-items/:id', requireAdmin, async (req, res) => {
-  const { id } = req.params;
-
-  try {
     const result = await pool.query(
-      'DELETE FROM bom_items WHERE id = $1',
+      'DELETE FROM cart_items WHERE id = $1 RETURNING id',
       [id]
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Позиция состава не найдена' });
+      return res.status(404).json({ error: 'Позиция корзины не найдена' });
     }
 
-    res.json({ success: true });
+    res.json({ ok: true });
   } catch (err) {
-    console.error('Delete BOM item error:', err);
-    res.status(500).json({ error: 'Ошибка удаления позиции состава' });
+    sendError(res, 'Ошибка удаления из корзины', err);
   }
 });
 
-// ====== запуск сервера ======
+// ---------------------- Запуск ----------------------
 
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`catalog-api listening on port ${PORT}`);
+  console.log(`API server is running on port ${PORT}`);
 });
